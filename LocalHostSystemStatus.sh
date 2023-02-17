@@ -1,42 +1,62 @@
 #!/bin/bash
 
-# Get command-line arguments
-email_address=$1
-teams_webhook_url=$2
+# Check for dependencies and install if not present
+if ! command -v ss &> /dev/null
+then
+    sudo apt-get update && sudo apt-get install -y iproute2
+fi
 
-# Check all ports
-echo "Checking all ports..."
+if ! command -v bc &> /dev/null
+then
+    sudo apt-get update && sudo apt-get install -y bc
+fi
 
-netstat -tunlp | awk '{print $4,$6,$7}' | tail -n +3 | sed -e 's/.*://' | awk '{print $1}' | sort | uniq -c | while read count port; do
-    if [ "$count" -gt 0 ]; then
-        echo "Port $port: $count connections"
-    fi
-done
+if ! command -v jq &> /dev/null
+then
+    sudo apt-get update && sudo apt-get install -y jq
+fi
 
-# Check disk statistics
-echo "Checking disk statistics..."
+# Create a lock file to ensure only one instance of the script runs at a time
+LOCKFILE=/tmp/LocalHostSystemStatus.lock
+if [ -f "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE")"; then
+    echo "Script is already running."
+    exit
+fi
+echo $$ > "$LOCKFILE"
 
-df -h | tail -n +2 | while read filesystem size used available percent mountpoint; do
-    if [ "${percent%?}" -ge 80 ]; then
-        echo "WARNING: Disk space on $mountpoint is $percent full"
-        
-        # Send email
-        echo "Sending email..."
-        echo "Disk space on $mountpoint is $percent full" | mail -s "Disk space warning" "$email_address"
-        
-        # Send Teams webhook
-        echo "Sending Teams webhook..."
-        json="{\"title\": \"Disk space warning\", \"text\": \"Disk space on $mountpoint is $percent full\"}"
-        curl -H "Content-Type: application/json" -d "$json" "$teams_webhook_url"
-    fi
-done
+# Get system information
+PORTS="$(ss -tulwn | awk '{print $1,$4,$5}')"
+DISK="$(df -h | awk '$NF=="/"{printf "%d/%d (%s)", $3,$2,$5}')"
+MEMORY="$(free | awk '/Mem/{printf("%.2f%"), $3/$2*100}')"
+CPU="$(top -bn1 | grep load | awk '{printf "%.2f\n", $(NF-2)}')"
+IP="$(hostname -I)"
+HOSTNAME="$(hostname)"
 
-# Check disk performance
-echo "Checking disk performance..."
+# Check disk space usage
+DISK_USAGE="$(df -h | awk '$NF=="/"{printf "%d", $5}')"
+if [ $DISK_USAGE -ge 80 ]; then
+    # Send an email notification
+    EMAIL="$1"
+    echo "Disk space usage is at $DISK_USAGE%. Sending an email notification to $EMAIL"
+    echo "Disk space usage is at $DISK_USAGE% on $HOSTNAME. Please take action." | mail -s "Disk Space Alert on $HOSTNAME" $EMAIL
+    
+    # Send a MS Teams notification
+    WEBHOOK="$2"
+    curl -H "Content-Type: application/json" -d "{\"text\": \"Disk space usage is at $DISK_USAGE% on $HOSTNAME. Please take action.\"}" $WEBHOOK
+fi
 
-iostat -dx 1 2 | tail -n +4 | head -n 1 | awk '{print "Disk read rate: " $3 " kB/s, disk write rate: " $4 " kB/s"}'
+# Log system information to a file in JSON format
+LOGFILE=/var/log/LocalHostSystemStatus.log
+if [ ! -f "$LOGFILE" ]; then
+    touch "$LOGFILE"
+    echo "[" >> "$LOGFILE"
+else
+    sed -i -e '$ d' "$LOGFILE"
+    echo "," >> "$LOGFILE"
+fi
+echo "{ \"timestamp\": \"$(date)\", \"ip\": \"$IP\", \"hostname\": \"$HOSTNAME\", \"ports\": \"$PORTS\", \"disk\": \"$DISK\", \"memory\": \"$MEMORY\", \"cpu\": \"$CPU\" }]" >> "$LOGFILE"
 
-# Check system load
-echo "Checking system load..."
+# Remove lock file
+trap "rm -f '$LOCKFILE'" EXIT
 
-uptime
+echo "System status logged to $LOGFILE"
